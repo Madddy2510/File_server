@@ -1,0 +1,19 @@
+[package]
+name = "rust-file-archive-server"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# CLI
+clap = { version = "4.5", features = ["derive"] }
+# Runtime
+tokio = { version = "1.37", features = ["full"] }
+# Server
+actix-web = "4.4"
+# Client
+reqwest = { version = "0.12", features = ["stream"] }
+# Archiving
+tar = "0.4"
+flate2 = "1.0"
+# Utilities
+futures-util = "0.3"

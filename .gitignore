@@ -1,0 +1,13 @@
+# Rust build and dependency files
+/target/
+/Cargo.lock
+
+# Operating System files
+.DS_Store
+Thumbs.db
+
+# Other temporary/download files
+*.tar.gz
+*.tar
+*.zip
+my_download.tar.gz
