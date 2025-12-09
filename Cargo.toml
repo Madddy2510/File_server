@@ -4,16 +4,22 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-# CLI
-clap = { version = "4.5", features = ["derive"] }
-# Runtime
+# --- Core Runtime ---
 tokio = { version = "1.37", features = ["full"] }
-# Server
-actix-web = "4.4"
-# Client
-reqwest = { version = "0.12", features = ["stream"] }
-# Archiving
+
+# --- Web Framework ---
+axum = { version = "0.7", features = ["macros"] }
+
+# --- Data Serialization (Required for Axum's Query extractor) ---
+serde = { version = "1.0", features = ["derive"] } 
+serde_json = "1.0"
+
+# --- Archiving ---
 tar = "0.4"
 flate2 = "1.0"
-# Utilities
-futures-util = "0.3"
+
+# --- Networking & HTTP Utilities ---
+local-ip-address = "0.5" # To determine the machine's local IP address
+urlencoding = "2.1"      # For safely encoding file paths in the download URL
+bytes = "1.6"            # Efficient byte manipulation for archiving/streaming
+http-range = "0.1.5"     # For parsing the HTTP Range header (Pause/Resume logic)

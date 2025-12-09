@@ -1,6 +1,6 @@
 # Rust build and dependency files
 /target/
-/Cargo.lock
+Cargo.lock
 
 # Operating System files
 .DS_Store
@@ -10,4 +10,3 @@ Thumbs.db
 *.tar.gz
 *.tar
 *.zip
-my_download.tar.gz
