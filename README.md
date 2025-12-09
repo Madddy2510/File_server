@@ -1,4 +1,4 @@
-Here is the final, properly formatted and readable version of the project instructions, with all emojis removed.
+
 1. Prerequisites
 
 Before starting, ensure you have the core tools for Rust development installed on your system:
