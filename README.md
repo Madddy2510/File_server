@@ -1,3 +1,4 @@
+### This project implements a Rust CLI File Server that archives multiple files specified at startup into a single .tar.gz archive. The server uses the Axum web framework to serve this archive over a network link, defaulting to port 8080 or a user-specified port. It also supports download pause and resume functionality by correctly handling HTTP Range requests, ensuring reliable large file transfers.
 
 1. Prerequisites
 
