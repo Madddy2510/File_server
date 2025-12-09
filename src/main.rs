@@ -1,289 +1,226 @@
-use clap::Parser;
-use tokio::io::{AsyncWriteExt, self as tokio_io};
-use actix_web::{web, App, HttpServer, HttpRequest, HttpResponse, Responder};
-use reqwest::header::{RANGE, HeaderValue};
-use std::io::{self, Read, Seek, SeekFrom};
-use std::path::{Path, PathBuf};
+use axum::{
+    Router,
+    body::Body,
+    extract::{State},
+    http::{
+        HeaderValue, StatusCode,
+    },
+    response::Response,
+    routing::get,
+};
+use std::{
+    env,
+    net::SocketAddr,
+    path::{Path, PathBuf},
+    io::{self},
+};
 use tar::Builder;
 use flate2::write::GzEncoder;
 use flate2::Compression;
-use futures_util::StreamExt;
+use local_ip_address::local_ip;
 
-// --- CLI STRUCTURE ---
+// --- Port Configuration ---
+// This serves as the default port
+const DEFAULT_SERVER_PORT: u16 = 8080; 
+// --------------------------
 
-/// A File Archiving and Serving CLI Tool
-#[derive(Parser, Debug)]
-#[clap(author, version, about, long_about = None)]
-struct Cli {
-    #[clap(subcommand)]
-    command: Commands,
-}
-
-#[derive(Debug, clap::Subcommand)]
-enum Commands {
-    /// Starts the file server to listen for download requests
-    Server {
-        /// The IP address and port to listen on (e.g., 127.0.0.1:8080)
-        #[clap(short, long, default_value = "127.0.0.1:8080")]
-        bind_address: String,
-    },
-    /// Requests and downloads a tar.gz archive from a server
-    Download {
-        /// The files to be archived and downloaded (path relative to server)
-        #[clap(required = true)]
-        files: Vec<String>,
-
-        /// The server URL (e.g., http://127.0.0.1:8080)
-        #[clap(short, long, default_value = "http://127.0.0.1:8080")]
-        server_url: String,
-
-        /// The name of the output archive file
-        #[clap(short, long, default_value = "archive.tar.gz")]
-        output: String,
-    },
+#[derive(Clone)]
+struct AppState {
+    // Field is unused by the handler, but needed for startup, so we allow dead_code to silence the warning
+    #[allow(dead_code)]
+    initial_files: Vec<String>,
 }
 
 // --- ARCHIVING LOGIC ---
 
-/// Archives a list of file paths into a tar.gz file at the given output path.
-fn create_tar_gz(file_paths: &[String], output_path: &Path) -> io::Result<()> {
-    println!("  -> Archiving files into: {}", output_path.display());
-
-    let file = std::fs::File::create(output_path)?;
-    let enc = GzEncoder::new(file, Compression::default());
+/// Archives a list of file paths into a tar.gz file in memory (Bytes).
+fn create_tar_gz(file_paths: &[String]) -> io::Result<bytes::Bytes> {
+    let mut buffer = Vec::new();
+    let enc = GzEncoder::new(&mut buffer, Compression::default());
     let mut tar = Builder::new(enc);
 
     for file_path_str in file_paths {
         let file_path = PathBuf::from(file_path_str);
-        if !file_path.exists() {
-            eprintln!("  ⚠️ Warning: File not found: {}", file_path_str);
-            continue;
+        
+        if !file_path.exists() || !file_path.is_file() {
+            return Err(io::Error::new(io::ErrorKind::NotFound, 
+                format!("Source file not found or is a directory: {}", file_path_str)));
         }
 
         let file_name = file_path.file_name()
-            .ok_or(io::Error::new(io::ErrorKind::InvalidInput, "Invalid file path"))?;
+            .ok_or(io::Error::new(io::ErrorKind::InvalidInput, "Invalid file path name"))?;
 
-        // Append the file to the archive
         tar.append_path_with_name(&file_path, file_name)?;
-        println!("    - Added: {}", file_path_str);
     }
 
-    tar.finish()?;
-    println!("  -> Archiving complete.");
-    Ok(())
+    let finished_tar = tar.into_inner().unwrap();
+    finished_tar.finish()?;
+    
+    Ok(bytes::Bytes::from(buffer))
 }
 
-// --- SERVER HANDLER ---
+// --- AXUM HANDLER (The core of the server) ---
 
-/// Handles the archive download request, including Range headers for pause/resume.
-async fn download_archive(req: HttpRequest, file_list: web::Data<Vec<String>>) -> impl Responder {
-    let temp_archive_path = PathBuf::from("temp_archive_data.tar.gz");
+async fn download_handler(
+    State(state): State<AppState>, 
+    req: axum::extract::Request,
+) -> Result<Response, StatusCode> {
+    
+    let files_to_archive = &state.initial_files;
+    let archive_filename = "archive.tar.gz";
 
-    // 1. Create the archive on the fly (or check cache/pre-generation)
-    if let Err(e) = create_tar_gz(&file_list, &temp_archive_path) {
-        eprintln!("Error creating archive: {}", e);
-        return HttpResponse::InternalServerError().body(format!("Failed to create archive: {}", e));
-    }
-
-    let mut file = match std::fs::File::open(&temp_archive_path) {
-        Ok(f) => f,
-        Err(_) => return HttpResponse::NotFound().body("Archive file not found on server."),
+    // 1. Generate the archive in a blocking task
+    let files_for_task = files_to_archive.clone();
+    
+    let archive_data = match tokio::task::spawn_blocking(move || create_tar_gz(&files_for_task)).await {
+        Ok(Ok(data)) => data,
+        Ok(Err(e)) => {
+            eprintln!("Error creating archive: {:?}", e);
+            return Err(StatusCode::BAD_REQUEST);
+        }
+        Err(_) => return Err(StatusCode::INTERNAL_SERVER_ERROR), 
     };
+    
+    let file_size = archive_data.len() as u64;
 
-    let file_size = match file.metadata() {
-        Ok(meta) => meta.len(),
-        Err(_) => return HttpResponse::InternalServerError().body("Could not get archive size."),
-    };
+    let range_header = req.headers().get("Range");
+    
+    let mut res = Response::builder();
+    let headers = res.headers_mut().unwrap();
 
-    let range_header = req.headers().get("Range").and_then(|h| h.to_str().ok());
+    // Set general headers for all downloads
+    headers.insert(axum::http::header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+    headers.insert(axum::http::header::CONTENT_TYPE, HeaderValue::from_static("application/x-tar"));
+    headers.insert(
+        axum::http::header::CONTENT_DISPOSITION,
+        HeaderValue::try_from(format!("attachment; filename=\"{}\"", archive_filename)).unwrap(),
+    );
 
     match range_header {
-        Some(range_str) => {
-            // Handle Range Request (206 Partial Content)
-            let range_str = range_str.trim_start_matches("bytes=");
-            let parts: Vec<&str> = range_str.split('-').collect();
+        Some(range_value) => {
+            // --- 2. Handle Range Request (206 Partial Content) for Resume ---
+            let range_str = range_value.to_str().unwrap_or("");
             
-            let start = parts.get(0).and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+            // Parse returns Vec<HttpRange>
+            let ranges: Vec<http_range::HttpRange> = http_range::HttpRange::parse(range_str, file_size)
+                .map_err(|_| StatusCode::RANGE_NOT_SATISFIABLE)?;
             
-            // If the range is just "bytes=start-", assume until the end
-            let end = parts.get(1)
-                .filter(|s| !s.is_empty())
-                .and_then(|s| s.parse::<u64>().ok())
-                .unwrap_or(file_size.saturating_sub(1));
+            // Get the first range in the vector
+            let range = ranges.into_iter().next().unwrap(); 
             
-            if start >= file_size || start > end {
-                return HttpResponse::RangeNotSatisfiable()
-                    .insert_header(("Content-Range", format!("bytes */{}", file_size)))
-                    .body("Invalid range request");
-            }
+            let start = range.start;
+            let length = range.length;
+            let end = start + length - 1;
+            let content_length = length;
             
-            let content_length = end.saturating_sub(start).saturating_add(1);
-
-            // Seek and read the chunk
-            if file.seek(SeekFrom::Start(start)).is_err() {
-                return HttpResponse::InternalServerError().body("Seek error.");
-            }
-            let mut buffer = vec![0; content_length as usize];
-            if file.read_exact(&mut buffer).is_err() {
-                 return HttpResponse::InternalServerError().body("Read error.");
+            if start >= file_size || end >= file_size || start > end {
+                eprintln!("Range check failed: {}-{}/{}", start, end, file_size);
+                return Err(StatusCode::RANGE_NOT_SATISFIABLE);
             }
 
-            println!("  <- Responding with 206 Partial Content: bytes {}-{}/{}", start, end, file_size);
+            // Slice the data for the requested range
+            let partial_data = archive_data.slice(start as usize..=end as usize);
 
-            HttpResponse::PartialContent() // Status 206
-                .content_type("application/x-tar")
-                .insert_header(("Content-Range", format!("bytes {}-{}/{}", start, end, file_size)))
-                .insert_header(("Content-Length", content_length))
-                .body(buffer)
+            // Set 206 Partial Content headers
+            headers.insert(axum::http::header::CONTENT_RANGE, 
+                HeaderValue::try_from(format!("bytes {}-{}/{}", start, end, file_size)).unwrap());
+            headers.insert(axum::http::header::CONTENT_LENGTH, 
+                HeaderValue::try_from(content_length).unwrap());
+
+            println!("<- Responding with 206 Partial Content: bytes {}-{}/{}", start, end, file_size);
+            
+            Ok(res.status(StatusCode::PARTIAL_CONTENT).body(Body::from(partial_data)).unwrap())
         },
         None => {
-            // Handle Full Download Request (200 OK)
-            println!("  <- Responding with 200 OK (Full content)");
+            // --- 3. Handle Full Download Request (200 OK) ---
+            headers.insert(axum::http::header::CONTENT_LENGTH, 
+                HeaderValue::try_from(file_size).unwrap());
+            
+            println!("<- Responding with 200 OK (Full content, {} bytes)", file_size);
 
-            let content = match std::fs::read(&temp_archive_path) {
-                Ok(c) => c,
-                Err(_) => return HttpResponse::InternalServerError().body("Failed to read archive file."),
-            };
-
-            HttpResponse::Ok() // Status 200
-                .content_type("application/x-tar")
-                .insert_header(("Content-Length", file_size))
-                .body(content)
+            Ok(res.status(StatusCode::OK).body(Body::from(archive_data)).unwrap())
         }
     }
 }
 
-// --- SERVER STARTUP ---
-
-async fn start_server(bind_address: &str, files: Vec<String>) -> io::Result<()> {
-    let file_data = web::Data::new(files);
-    
-    // Safety check: Create a dummy file for the archive logic to find, if not present
-    std::fs::write("temp_archive_data.tar.gz", "placeholder")?;
-
-    println!("🌍 Server listening on http://{}", bind_address);
-    println!("Serving files: {:?}", file_data.get_ref());
-
-    HttpServer::new(move || {
-        App::new()
-            .app_data(file_data.clone())
-            .route("/download", web::get().to(download_archive))
-    })
-    .bind(bind_address)?
-    .run()
-    .await
-}
-
-// --- CLIENT LOGIC ---
-
-/// Initiates the download, checking for an existing file to resume.
-async fn start_download(files: &[String], server_url: &str, output: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let client = reqwest::Client::new();
-
-    // 1. Construct the files query parameter for the server to know what to archive
-    let file_params: Vec<(&str, &str)> = files.iter().map(|f| ("files", f.as_str())).collect();
-    let url = reqwest::Url::parse_with_params(&format!("{}/download", server_url), &file_params)
-        .expect("Failed to create request URL.");
-
-    let mut start_byte: u64 = 0;
-
-    // 2. Check for existing file to determine resume point
-    if let Ok(metadata) = tokio::fs::metadata(output).await {
-        start_byte = metadata.len();
-        println!("  ➡️ Found partial file. Resuming download from byte: {}", start_byte);
-    } else {
-        println!("  ➡️ Starting fresh download.");
-    }
-
-    // 3. Build the request with the Range header if resuming
-    let mut request = client.get(url);
-    if start_byte > 0 {
-        let range_value = format!("bytes={}-", start_byte);
-        request = request.header(RANGE, HeaderValue::from_str(&range_value)?);
-    }
-
-    let response = request.send().await?.error_for_status()?;
-
-    let status = response.status();
-    println!("  <- Server Status: {}", status);
-
-    if status.is_success() && status.as_u16() != 206 {
-        // Full download (200 OK) - truncate file if it existed
-        start_byte = 0;
-    } else if status.as_u16() == 206 && start_byte == 0 {
-        println!("  ⚠️ Warning: Got Partial Content (206) response without an initial offset.");
-    }
-
-
-    // 4. Open the output file
-    let mut file = tokio::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .append(start_byte > 0) // Append if resuming, overwrite if 200 OK
-        .truncate(start_byte == 0 && status.as_u16() != 206)
-        .open(output)
-        .await?;
-
-    // 5. Stream the response data
-    let mut stream = response.bytes_stream();
-    let mut downloaded_bytes = 0;
-
-    while let Some(chunk_result) = stream.next().await {
-        let chunk = chunk_result?;
-        file.write_all(&chunk).await?;
-        downloaded_bytes += chunk.len();
-        
-        // Simple progress indicator
-        if downloaded_bytes % (1024 * 50) == 0 {
-            print!("\r  📥 Downloaded: {} KB", (start_byte + downloaded_bytes as u64) / 1024);
-            tokio_io::stdout().flush().await?;
-        }
-    }
-    
-    // Final flush and message
-    tokio_io::stdout().flush().await?;
-    println!("\n✅ Download complete. Total bytes written: {}", start_byte + downloaded_bytes as u64);
-
-    Ok(())
-}
-
-
-// --- MAIN EXECUTION ---
+// --- MAIN SETUP ---
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let cli = Cli::parse();
-
-    match cli.command {
-        Commands::Server { bind_address } => {
-            // NOTE: In a real app, the server would need to know WHICH files to serve
-            // This example hardcodes a list for demonstration, assuming the files exist
-            // in the server's working directory.
-            let dummy_files = vec![
-                "file1.txt".to_string(), 
-                "file2.txt".to_string(),
-                "file3.txt".to_string(),
-            ];
-            
-            // To make the example runnable, create the dummy files first
-            for (i, name) in dummy_files.iter().enumerate() {
-                if tokio::fs::metadata(name).await.is_err() {
-                    tokio::fs::write(name, format!("This is the content of {} - size: {}\n", name, i)).await?;
-                }
-            }
-
-            println!("🚀 Starting File Archiving Server...");
-            start_server(&bind_address, dummy_files).await?;
-        }
-        Commands::Download { files, server_url, output } => {
-            println!("⬇️  Initiating Download Command...");
-            start_download(&files, &server_url, &output).await?;
+async fn main() {
+    let mut args: Vec<String> = env::args().collect();
+    
+    // --- ARGUMENT PARSING LOGIC ---
+    let files_start_index = 1; // args[0] is program path, files start at args[1]
+    
+    // 1. Check for minimum required arguments (program name + at least one file)
+    if args.len() < files_start_index + 1 {
+        eprintln!("Usage: cargo run -- <file_path_1> [file_path_2] [..] [optional_port]");
+        eprintln!("Example: cargo run -- fileA.txt fileB.txt 8888");
+        std::process::exit(1);
+    }
+    
+    // 2. Extract arguments (excluding the program name itself)
+    let mut args_without_program_name: Vec<String> = args.drain(files_start_index..).collect();
+    
+    let mut server_port = DEFAULT_SERVER_PORT;
+    
+    // 3. Check if the last argument is a valid port number
+    if let Some(last_arg) = args_without_program_name.last() {
+        if let Ok(port) = last_arg.parse::<u16>() {
+            // It's a valid port, so use it and remove it from the list
+            server_port = port;
+            args_without_program_name.pop();
         }
     }
 
-    // Clean up the temporary archive file after server shutdown (if server logic ran)
-    // NOTE: This cleanup is incomplete in a real server lifecycle but included for good measure.
-    let _ = tokio::fs::remove_file("temp_archive_data.tar.gz").await;
+    // 4. The remaining arguments are the file paths
+    let initial_files = args_without_program_name; // Now defined!
+
+    // 5. Final validation 
+    if initial_files.is_empty() {
+         eprintln!("Error: You must specify at least one file path.");
+         std::process::exit(1);
+    }
     
-    Ok(())
+    // --- END ARGUMENT PARSING LOGIC ---
+
+    for file_path in &initial_files {
+        if !Path::new(file_path).is_file() {
+            eprintln!("Error: Required source file not found or is a directory: {}", file_path);
+            std::process::exit(1);
+        }
+    }
+
+    let local_ip_str = local_ip().map(|ip| ip.to_string()).unwrap_or_else(|e| {
+        eprintln!("Warning: Could not determine local IP. Using 127.0.0.1. Error: {}", e);
+        "127.0.0.1".to_string()
+    });
+    
+    let base_url = format!("http://{}:{}", local_ip_str, server_port);
+    let download_url = format!("{}/download", base_url);
+
+    println!("--- File Archive Server Started (Axum) ---");
+    println!("Files being served: {:?}", initial_files);
+    println!("Server running on: {}", base_url);
+    println!("----------------------------------------------------------");
+    println!(" DIRECT DOWNLOAD LINK (Clickable, Port {}):", server_port);
+    println!("{}", download_url);
+    println!("----------------------------------------------------------");
+
+    let app_state = AppState { initial_files };
+    let app = Router::new()
+        .route("/download", get(download_handler))
+        .with_state(app_state);
+
+    let addr = SocketAddr::from(([0, 0, 0, 0], server_port)); 
+
+    match tokio::net::TcpListener::bind(addr).await {
+        Ok(listener) => {
+            axum::serve(listener, app).await.unwrap();
+        }
+        Err(e) => {
+            eprintln!("Error binding to address {}:{} -- Is the port already in use?", local_ip_str, server_port);
+            eprintln!("Details: {}", e);
+        }
+    }
 }
